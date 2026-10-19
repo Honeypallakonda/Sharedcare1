@@ -45,6 +45,12 @@ describe('reachedStages', () => {
     it('sends the day-before reminder from 18:00 the evening before', () => {
         expect(reachedStages(at(13, 18, 30), deadline, cfg)).toEqual(['day_before']);
     });
+    it('never sends a "tomorrow" reminder on the deadline day itself', () => {
+        // e.g. a task created that morning for 18:00: nothing until the same-day trigger
+        expect(reachedStages(at(14, 9, 0), deadline, cfg)).toEqual([]);
+        expect(reachedStages(at(14, 14, 59), deadline, cfg)).toEqual([]);
+        expect(reachedStages(at(14, 15, 0), deadline, cfg)).toEqual(['same_day']);
+    });
     it('sends the same-day reminder 3 hours before, and 2 hours when configured', () => {
         expect(reachedStages(at(14, 15, 0), deadline, cfg)).toContain('same_day');
         expect(reachedStages(at(14, 14, 59), deadline, cfg)).not.toContain('same_day');

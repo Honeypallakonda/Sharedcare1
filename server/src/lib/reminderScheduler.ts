@@ -409,7 +409,10 @@ export function reachedStages(now: Date, deadline: Date, cfg: ReminderConfig): D
     const escalation = new Date(deadline.getTime() - cfg.escalationHours * HOUR);
 
     const stages: DeadlineStage[] = [];
-    if (dayBefore.getTime() < sameDay.getTime() && now.getTime() >= dayBefore.getTime()) stages.push('day_before');
+    // "Tomorrow" is only true until the deadline's own day starts: a task created
+    // that morning must not get a late "tomorrow" reminder, the same-day one takes over.
+    const onDeadlineDay = now.toDateString() === deadline.toDateString();
+    if (!onDeadlineDay && dayBefore.getTime() < sameDay.getTime() && now.getTime() >= dayBefore.getTime()) stages.push('day_before');
     if (now.getTime() >= sameDay.getTime()) stages.push('same_day');
     if (now.getTime() >= escalation.getTime()) stages.push('escalation');
     return stages;
