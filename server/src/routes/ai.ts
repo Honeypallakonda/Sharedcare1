@@ -1,7 +1,7 @@
 import { Router, Response } from 'express';
 import { query } from '../db';
 import { authMiddleware } from '../middleware/auth';
-import { circleMiddleware, requireAdmin, CircleRequest } from '../middleware/circle';
+import { circleMiddleware, requireAdmin, requireContentWriter, CircleRequest } from '../middleware/circle';
 import { encryptCredentials } from '../utils/crypto';
 import { assertSafeIntegrationUrl, UnsafeUrlError, unsafeUrlMessage } from '../utils/urlGuard';
 import {
@@ -16,9 +16,14 @@ import {
 } from '../services/ai';
 import {
     PARSE_SCHEMA,
+    CHANGES_SCHEMA,
     buildParsePrompt,
+    buildChangesPrompt,
     validateParsedItems,
+    validateChanges,
+    localToday,
     type CircleMemberRef,
+    type DetectedChange,
 } from '../services/ai/assistant';
 import logger from '../lib/logger';
 import { langFromRequest, t, type Lang } from '../lib/i18n';
@@ -269,6 +274,147 @@ router.post('/parse', async (req: CircleRequest, res) => {
         res.json({ success: true, data: { items } });
     } catch (error) {
         handleAiError(res, error, 'parse', lang);
+    }
+});
+
+// ─── Change detection (deterministic, SQL) ───────────────────────────────────
+
+const MIN_VITAL_SAMPLES = 2;
+const VITAL_RELATIVE_THRESHOLD = 0.1; // 10 % between the two windows
+
+const round1 = (n: number) => Math.round(n * 10) / 10;
+
+/**
+ * Compares the last `days` days with the `days` days before them.
+ * Returns an empty list when nothing noteworthy changed (no model call needed).
+ */
+async function detectChanges(circleId: string, days = 7): Promise<DetectedChange[]> {
+    const now = new Date();
+    const curStart = new Date(now.getTime() - days * 86_400_000);
+    const prevStart = new Date(now.getTime() - 2 * days * 86_400_000);
+    const changes: Omit<DetectedChange, 'id'>[] = [];
+
+    const [vitals, intakes, journal, newMeds, stoppedMeds, prescriptions] = await Promise.all([
+        query(
+            `SELECT type,
+                    AVG(value) FILTER (WHERE measured_at >= $2)::float8 AS cur,
+                    AVG(value) FILTER (WHERE measured_at <  $2)::float8 AS prev,
+                    COUNT(*) FILTER (WHERE measured_at >= $2)::int AS cur_n,
+                    COUNT(*) FILTER (WHERE measured_at <  $2)::int AS prev_n,
+                    MAX(unit) AS unit
+             FROM vitals
+             WHERE circle_id = $1 AND measured_at >= $3
+             GROUP BY type`,
+            [circleId, curStart, prevStart]
+        ),
+        query(
+            `SELECT COUNT(*) FILTER (WHERE due_at >= $2 AND status = 'missed')::int AS cur_missed,
+                    COUNT(*) FILTER (WHERE due_at <  $2 AND status = 'missed')::int AS prev_missed
+             FROM medication_intakes
+             WHERE circle_id = $1 AND due_at >= $3 AND due_at <= $4`,
+            [circleId, curStart, prevStart, now]
+        ),
+        query(
+            `SELECT type,
+                    COUNT(*) FILTER (WHERE occurred_at >= $2)::int AS cur,
+                    COUNT(*) FILTER (WHERE occurred_at <  $2)::int AS prev
+             FROM journal_entries
+             WHERE circle_id = $1 AND type IN ('incident', 'mood') AND occurred_at >= $3
+             GROUP BY type`,
+            [circleId, curStart, prevStart]
+        ),
+        query(
+            `SELECT name, dosage FROM medications
+             WHERE circle_id = $1 AND created_at >= $2 AND active = TRUE`,
+            [circleId, curStart]
+        ),
+        query(
+            `SELECT name FROM medications
+             WHERE circle_id = $1 AND end_date >= $2::date AND end_date <= CURRENT_DATE`,
+            [circleId, curStart]
+        ),
+        query(
+            `SELECT title, to_char(renewal_date, 'YYYY-MM-DD') AS renewal_date
+             FROM prescriptions
+             WHERE circle_id = $1 AND renewal_date IS NOT NULL
+               AND renewal_date <= CURRENT_DATE + INTERVAL '14 days'
+             ORDER BY renewal_date`,
+            [circleId]
+        ),
+    ]);
+
+    for (const v of vitals.rows as Array<{ type: string; cur: number | null; prev: number | null; cur_n: number; prev_n: number; unit: string | null }>) {
+        if (v.cur === null || v.prev === null || v.cur_n < MIN_VITAL_SAMPLES || v.prev_n < MIN_VITAL_SAMPLES || v.prev === 0) continue;
+        const delta = (v.cur - v.prev) / Math.abs(v.prev);
+        if (Math.abs(delta) < VITAL_RELATIVE_THRESHOLD) continue;
+        const pct = Math.round(Math.abs(delta) * 100);
+        changes.push({
+            kind: 'vital',
+            severity: Math.abs(delta) >= 0.2 ? 'alert' : 'watch',
+            fact: `${v.type}: average ${round1(v.prev)} -> ${round1(v.cur)}${v.unit ? ' ' + v.unit : ''} (${delta > 0 ? '+' : '-'}${pct}%, ${v.prev_n} vs ${v.cur_n} measurements)`,
+        });
+    }
+
+    const intake = intakes.rows[0] as { cur_missed: number; prev_missed: number } | undefined;
+    if (intake && intake.cur_missed > intake.prev_missed && intake.cur_missed >= 2) {
+        changes.push({
+            kind: 'missed_doses',
+            severity: intake.cur_missed >= 4 ? 'alert' : 'watch',
+            fact: `Missed medication doses: ${intake.prev_missed} -> ${intake.cur_missed} over the last ${days} days`,
+        });
+    }
+
+    for (const j of journal.rows as Array<{ type: 'incident' | 'mood'; cur: number; prev: number }>) {
+        if (j.cur > j.prev) {
+            changes.push({
+                kind: j.type,
+                severity: j.type === 'incident' ? 'alert' : 'watch',
+                fact: `Journal "${j.type}" entries: ${j.prev} -> ${j.cur} over the last ${days} days`,
+            });
+        }
+    }
+
+    for (const m of newMeds.rows as Array<{ name: string; dosage: string | null }>) {
+        changes.push({ kind: 'medication', severity: 'watch', fact: `New medication added: ${m.name}${m.dosage ? ' ' + m.dosage : ''}` });
+    }
+    for (const m of stoppedMeds.rows as Array<{ name: string }>) {
+        changes.push({ kind: 'medication', severity: 'info', fact: `Medication treatment ended: ${m.name}` });
+    }
+    for (const p of prescriptions.rows as Array<{ title: string; renewal_date: string }>) {
+        changes.push({
+            kind: 'prescription',
+            severity: p.renewal_date < localToday().iso ? 'alert' : 'watch',
+            fact: `Prescription "${p.title}" renewal due ${p.renewal_date}`,
+        });
+    }
+
+    return changes.slice(0, 12).map((c, i) => ({ ...c, id: `c${i + 1}` }));
+}
+
+// POST /api/ai/changes : family/admin only. Compares the last N days with the N days
+// before (deterministic), then asks the model to explain the changes and propose
+// tasks. Nothing is saved: the client confirms then POSTs to /api/tasks.
+router.post('/changes', requireContentWriter, async (req: CircleRequest, res) => {
+    const lang = langFromRequest(req);
+    try {
+        const settings = await requireConfiguredAi(req, res);
+        if (!settings) return;
+
+        const rawDays = Number(req.body?.days);
+        const days = [7, 14, 30].includes(rawDays) ? rawDays : 7;
+
+        const changes = await detectChanges(req.circleId!, days);
+        if (changes.length === 0) {
+            return res.json({ success: true, data: { summary: '', changes: [], suggestions: [] } });
+        }
+
+        const recipient = await query('SELECT first_name FROM care_recipients WHERE circle_id = $1', [req.circleId]);
+        const { system, user } = buildChangesPrompt(changes, recipient.rows[0]?.first_name ?? '', lang, days);
+        const raw = await aiComplete(settings, { system, user, jsonSchema: CHANGES_SCHEMA });
+
+        res.json({ success: true, data: validateChanges(raw, changes, lang, days) });
+    } catch (error) {
+        handleAiError(res, error, 'changes', lang);
     }
 });
 

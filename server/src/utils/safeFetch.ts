@@ -79,15 +79,15 @@ let undiciLoad: Promise<{ Agent: UndiciAgentCtor } | null> | null = null;
  * (only undici-types is installed for typings). Returns null if undici is not
  * available at runtime, so callers can fall back to degraded pinning.
  */
-async function loadUndici(): Promise<{ Agent: UndiciAgentCtor } | null> {
+async function loadUndici(): Promise<{ Agent: UndiciAgentCtor; fetch?: typeof fetch } | null> {
     if (undiciLoad) return undiciLoad;
     undiciLoad = (async () => {
         try {
             // Build the specifier at runtime so neither tsc nor a bundler tries to
             // statically resolve the value module (only undici-types is on disk).
             const spec: string = ['un', 'dici'].join('');
-            const mod = (await import(spec)) as { Agent?: UndiciAgentCtor };
-            return typeof mod.Agent === 'function' ? { Agent: mod.Agent } : null;
+            const mod = (await import(spec)) as { Agent?: UndiciAgentCtor; fetch?: typeof fetch };
+            return typeof mod.Agent === 'function' ? { Agent: mod.Agent, fetch: mod.fetch } : null;
         } catch {
             return null;
         }
@@ -212,7 +212,12 @@ async function doSafeFetch(rawUrl: string, options: RequestInit, state: Internal
 
     let response: Response;
     try {
-        response = await fetch(target.toString(), init);
+        // A dispatcher built by the installed undici must be used with that SAME
+        // undici's fetch: passing it to Node's built-in fetch (bundled, older
+        // undici) fails with "invalid onRequestStart method".
+        const undici = dispatcher ? await loadUndici() : null;
+        const doFetch = undici?.fetch ?? fetch;
+        response = await doFetch(target.toString(), init);
     } finally {
         clearTimeout(timer);
     }

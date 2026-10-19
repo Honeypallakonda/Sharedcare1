@@ -1,15 +1,19 @@
 import cron from 'node-cron';
-import { format } from 'date-fns';
+import { addDays, format, startOfDay } from 'date-fns';
 import { query } from '../db';
 import { createNotification } from './notifications';
 import logger from './logger';
 import { pickLang } from './i18n';
+import { getAppUrl, isMailConfigured, sendMail } from './mailer';
 
 // Rappels planifiés du cercle de soin:
 //  - rappels d'événements (events.reminder_30min / reminder_1hour), notifiés
 //    à TOUS les membres du cercle (notification interne + web push);
 //  - rappel quotidien (9h) de renouvellement d'ordonnance, notifié aux membres
 //    admin + family du cercle, une seule fois par jour et par ordonnance.
+//  - rappels d'échéance par e-mail + notification (tâches et événements): la
+//    veille, puis quelques heures avant le jour J, avec ESCALADE vers les autres
+//    membres quand la personne assignée n'a pas terminé la tâche (voir plus bas).
 // Les rappels de prise de médicaments (medication_intakes) sont gérés ailleurs.
 
 interface EventRow {
@@ -343,12 +347,279 @@ async function checkHeatwaveHydration(): Promise<void> {
     }
 }
 
+// ─── Deadline reminders (day before + same day) and escalation ───────────────
+//
+// Applies to tasks (tasks.due_date, not completed) and to events that have a
+// reminder flag. Per item, each person is told at most once per stage (dedup on
+// notifications: user + related_id + type), by in-app/push notification AND, when
+// SMTP is configured, by e-mail:
+//   - day_before : the evening before (REMINDER_DAY_BEFORE_HOUR, default 18)
+//   - same_day   : REMINDER_SAME_DAY_HOURS before the deadline (default 3; 2 works)
+//   - escalation : tasks only. The assigned member has not completed the task
+//                  ESCALATION_HOURS_BEFORE (default 1) before the deadline, so the
+//                  OTHER admin/family members are asked to step in.
+// A task whose due_date has no time of day (00:00) is due at TASK_DEADLINE_HOUR.
+
+export interface ReminderConfig {
+    dayBeforeHour: number;
+    sameDayHours: number;
+    deadlineHour: number;
+    escalationHours: number;
+}
+
+export type DeadlineStage = 'day_before' | 'same_day' | 'escalation';
+
+const intEnv = (value: string | undefined, fallback: number, min: number, max: number): number => {
+    const n = Number.parseInt(value ?? '', 10);
+    return Number.isFinite(n) && n >= min && n <= max ? n : fallback;
+};
+
+export function loadReminderConfig(env: NodeJS.ProcessEnv = process.env): ReminderConfig {
+    return {
+        dayBeforeHour: intEnv(env.REMINDER_DAY_BEFORE_HOUR, 18, 0, 23),
+        sameDayHours: intEnv(env.REMINDER_SAME_DAY_HOURS, 3, 1, 12),
+        deadlineHour: intEnv(env.TASK_DEADLINE_HOUR, 18, 1, 23),
+        escalationHours: intEnv(env.ESCALATION_HOURS_BEFORE, 1, 1, 12),
+    };
+}
+
+/** Parses a naive 'YYYY-MM-DDTHH:mm:ss' local timestamp (no timezone shift). */
+const parseNaive = (value: string): Date => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/.exec(value);
+    if (!m) return new Date(NaN);
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6] ?? 0));
+};
+
+/** A task's deadline: its own time, or TASK_DEADLINE_HOUR when it is date-only. */
+export function taskDeadline(dueNaive: string, cfg: ReminderConfig): Date {
+    const d = parseNaive(dueNaive);
+    if (Number.isNaN(d.getTime())) return d;
+    if (d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0) d.setHours(cfg.deadlineHour, 0, 0, 0);
+    return d;
+}
+
+/** Stages whose trigger time has passed while the deadline is still ahead. */
+export function reachedStages(now: Date, deadline: Date, cfg: ReminderConfig): DeadlineStage[] {
+    if (Number.isNaN(deadline.getTime()) || now.getTime() >= deadline.getTime()) return [];
+    const HOUR = 3_600_000;
+    const dayBefore = new Date(deadline);
+    dayBefore.setDate(dayBefore.getDate() - 1);
+    dayBefore.setHours(cfg.dayBeforeHour, 0, 0, 0);
+    const sameDay = new Date(deadline.getTime() - cfg.sameDayHours * HOUR);
+    const escalation = new Date(deadline.getTime() - cfg.escalationHours * HOUR);
+
+    const stages: DeadlineStage[] = [];
+    if (dayBefore.getTime() < sameDay.getTime() && now.getTime() >= dayBefore.getTime()) stages.push('day_before');
+    if (now.getTime() >= sameDay.getTime()) stages.push('same_day');
+    if (now.getTime() >= escalation.getTime()) stages.push('escalation');
+    return stages;
+}
+
+/** Only the latest reminder stage is sent (a late server start must not send both). */
+export const latestReminderStage = (stages: DeadlineStage[]): 'day_before' | 'same_day' | null =>
+    stages.includes('same_day') ? 'same_day' : stages.includes('day_before') ? 'day_before' : null;
+
+interface DeadlineItem {
+    kind: 'task' | 'event';
+    id: string;
+    circleId: string;
+    title: string;
+    deadline: Date;
+}
+
+interface DeadlineRecipient {
+    member_id: string;
+    user_id: string;
+    role: string;
+    language: string;
+    email: string;
+    name: string;
+}
+
+function buildDeadlineTexts(
+    item: DeadlineItem,
+    stage: DeadlineStage,
+    language: string,
+    hoursLeft: number,
+    assigneeNames: string
+): ReminderTexts {
+    const lang = pickLang(language);
+    const hm = format(item.deadline, 'HH:mm');
+    const t = item.title;
+    const isTask = item.kind === 'task';
+
+    if (stage === 'day_before') {
+        if (lang === 'es') return { title: `⏰ Mañana: ${t}`, body: isTask ? `Para mañana antes de las ${hm}.` : `Mañana a las ${hm}.` };
+        if (lang === 'en') return { title: `⏰ Tomorrow: ${t}`, body: isTask ? `Due tomorrow by ${hm}.` : `Tomorrow at ${hm}.` };
+        return { title: `⏰ Demain : ${t}`, body: isTask ? `À faire demain avant ${hm}.` : `Demain à ${hm}.` };
+    }
+    if (stage === 'same_day') {
+        if (lang === 'es') return { title: `⏰ Hoy: ${t}`, body: isTask ? `Quedan unas ${hoursLeft} h (antes de las ${hm}).` : `Empieza en unas ${hoursLeft} h (${hm}).` };
+        if (lang === 'en') return { title: `⏰ Today: ${t}`, body: isTask ? `About ${hoursLeft} h left (by ${hm}).` : `Starts in about ${hoursLeft} h (${hm}).` };
+        return { title: `⏰ Aujourd'hui : ${t}`, body: isTask ? `Il reste environ ${hoursLeft} h (avant ${hm}).` : `Commence dans environ ${hoursLeft} h (${hm}).` };
+    }
+    // escalation
+    if (lang === 'es') {
+        return { title: `🤝 Se necesita ayuda: ${t}`, body: `${assigneeNames || 'La persona asignada'} aún no lo ha terminado (antes de las ${hm}). ¿Alguien puede ayudar?` };
+    }
+    if (lang === 'en') {
+        return { title: `🤝 Needs a hand: ${t}`, body: `${assigneeNames || 'The assigned person'} has not finished this yet (due by ${hm}). Can someone step in?` };
+    }
+    return { title: `🤝 Besoin d'un coup de main : ${t}`, body: `${assigneeNames || 'La personne assignée'} n'a pas encore terminé (avant ${hm}). Quelqu'un peut-il prendre le relais ?` };
+}
+
+async function sendDeadlineEmail(recipient: DeadlineRecipient, texts: ReminderTexts, kind: 'task' | 'event'): Promise<void> {
+    if (process.env.REMINDER_EMAIL === 'false') return;
+    if (!isMailConfigured()) {
+        logger.info('reminder.email_skipped', { reason: 'smtp_not_configured', subject: texts.title });
+        return;
+    }
+    const lang = pickLang(recipient.language);
+    const greeting = lang === 'es' ? `Hola ${recipient.name},` : lang === 'en' ? `Hello ${recipient.name},` : `Bonjour ${recipient.name},`;
+    const link = `${getAppUrl()}${kind === 'task' ? '/tasks' : '/calendar'}`;
+    try {
+        await sendMail({
+            to: recipient.email,
+            subject: texts.title,
+            text: `${greeting}\n\n${texts.body}\n\n${link}`,
+            html: `<p>${greeting}</p><p>${texts.body}</p><p><a href="${link}">${link}</a></p>`,
+        });
+        logger.info('reminder.email_sent', { subject: texts.title });
+    } catch (err) {
+        logger.warn('reminder.email_failed', { error: err instanceof Error ? err.message : String(err) });
+    }
+}
+
+/** Circle members who have not yet received this (type, related_id) notification. */
+async function deadlineRecipients(circleId: string, relatedId: string, type: string): Promise<DeadlineRecipient[]> {
+    const { rows } = await query(
+        `SELECT cm.id AS member_id, cm.user_id, cm.role, COALESCE(u.language, 'fr') AS language, u.email, u.name
+         FROM circle_members cm
+         JOIN users u ON u.id = cm.user_id
+         WHERE cm.circle_id = $1
+           AND NOT EXISTS (
+             SELECT 1 FROM notifications n
+             WHERE n.user_id = cm.user_id AND n.related_id = $2 AND n.type = $3
+           )`,
+        [circleId, relatedId, type]
+    );
+    return rows as DeadlineRecipient[];
+}
+
+async function notifyDeadline(
+    item: DeadlineItem,
+    stage: DeadlineStage,
+    recipients: DeadlineRecipient[],
+    now: Date,
+    assigneeNames = ''
+): Promise<void> {
+    if (recipients.length === 0) return;
+    const type = `${item.kind}_${stage}`;
+    const hoursLeft = Math.max(1, Math.round((item.deadline.getTime() - now.getTime()) / 3_600_000));
+    for (const recipient of recipients) {
+        const texts = buildDeadlineTexts(item, stage, recipient.language, hoursLeft, assigneeNames);
+        await createNotification({
+            userId: recipient.user_id,
+            circleId: item.circleId,
+            title: texts.title,
+            message: texts.body,
+            type,
+            relatedId: item.id,
+            url: item.kind === 'task' ? '/tasks' : '/calendar',
+            tag: `${type}-${item.id}`,
+        });
+        await sendDeadlineEmail(recipient, texts, item.kind);
+    }
+    logger.info('reminder.deadline_sent', { kind: item.kind, itemId: item.id, stage, recipients: recipients.length });
+}
+
+const isCareGiver = (r: DeadlineRecipient): boolean => r.role === 'admin' || r.role === 'family';
+
+async function processTaskDeadlines(now: Date, cfg: ReminderConfig): Promise<void> {
+    const { rows } = await query(
+        `SELECT t.id, t.circle_id, t.title,
+                to_char(t.due_date, 'YYYY-MM-DD"T"HH24:MI:SS') AS due,
+                COALESCE(t.assigned_to, '[]'::jsonb) AS assigned_to
+         FROM tasks t
+         WHERE t.is_completed = FALSE
+           AND t.due_date IS NOT NULL
+           AND t.due_date >= $1 AND t.due_date < $2`,
+        [toLocalNaive(startOfDay(now)), toLocalNaive(addDays(startOfDay(now), 3))]
+    );
+
+    for (const row of rows as Array<{ id: string; circle_id: string; title: string; due: string; assigned_to: unknown }>) {
+        const deadline = taskDeadline(row.due, cfg);
+        const stages = reachedStages(now, deadline, cfg);
+        if (stages.length === 0) continue;
+
+        const item: DeadlineItem = { kind: 'task', id: row.id, circleId: row.circle_id, title: row.title, deadline };
+        const assigned = Array.isArray(row.assigned_to) ? (row.assigned_to as string[]) : [];
+
+        // 1) Reminder (day before / same day): the assigned members, or every
+        //    admin/family member when nobody is assigned.
+        const reminder = latestReminderStage(stages);
+        if (reminder) {
+            const all = await deadlineRecipients(item.circleId, item.id, `task_${reminder}`);
+            const targets = assigned.length > 0 ? all.filter((r) => assigned.includes(r.member_id)) : all.filter(isCareGiver);
+            await notifyDeadline(item, reminder, targets, now);
+        }
+
+        // 2) Escalation: still not completed shortly before the deadline, so the
+        //    other care-circle members are asked to step in.
+        if (stages.includes('escalation') && assigned.length > 0) {
+            const all = await deadlineRecipients(item.circleId, item.id, 'task_escalation');
+            const others = all.filter((r) => isCareGiver(r) && !assigned.includes(r.member_id));
+            if (others.length > 0) {
+                const { rows: names } = await query(
+                    `SELECT u.name FROM circle_members cm JOIN users u ON u.id = cm.user_id
+                     WHERE cm.circle_id = $1 AND cm.id = ANY($2::uuid[])`,
+                    [item.circleId, assigned]
+                );
+                await notifyDeadline(item, 'escalation', others, now, (names as Array<{ name: string }>).map((n) => n.name).join(', '));
+            }
+        }
+    }
+}
+
+async function processEventDeadlines(now: Date, cfg: ReminderConfig): Promise<void> {
+    const { rows } = await query(
+        `SELECT e.id, e.circle_id, e.title, to_char(e.start_time, 'YYYY-MM-DD"T"HH24:MI:SS') AS due
+         FROM events e
+         WHERE (e.reminder_30min = TRUE OR e.reminder_1hour = TRUE)
+           AND e.start_time >= $1 AND e.start_time < $2`,
+        [toLocalNaive(now), toLocalNaive(addDays(startOfDay(now), 3))]
+    );
+
+    for (const row of rows as Array<{ id: string; circle_id: string; title: string; due: string }>) {
+        const deadline = parseNaive(row.due);
+        const reminder = latestReminderStage(reachedStages(now, deadline, cfg));
+        if (!reminder) continue;
+        const item: DeadlineItem = { kind: 'event', id: row.id, circleId: row.circle_id, title: row.title, deadline };
+        await notifyDeadline(item, reminder, await deadlineRecipients(item.circleId, item.id, `event_${reminder}`), now);
+    }
+}
+
+export async function checkDeadlineReminders(now: Date = new Date(), cfg: ReminderConfig = loadReminderConfig()): Promise<void> {
+    try {
+        await processTaskDeadlines(now, cfg);
+        await processEventDeadlines(now, cfg);
+    } catch (err) {
+        logger.error('reminder.deadline_error', { error: err instanceof Error ? err.message : String(err) });
+    }
+}
+
 export function startReminderScheduler(): void {
     const tz = process.env.TZ ?? 'Europe/Paris';
 
     // Event reminders: every minute
     cron.schedule('* * * * *', () => {
         void checkEventReminders();
+    }, { timezone: tz });
+
+    // Deadline reminders (day before / same day, e-mail + notification) and
+    // escalation to the other members: every minute, deduplicated per user.
+    cron.schedule('* * * * *', () => {
+        void checkDeadlineReminders();
     }, { timezone: tz });
 
     // Heat-episode hydration reminders: every minute (matches the configured

@@ -537,3 +537,260 @@ export function validateVoiceJournal(raw: Record<string, unknown>, fallbackText:
 
     return { type, content, shopping_items: items };
 }
+
+// ─── /api/ai/changes ──────────────────────────────────────────────────────────
+// "What changed": the comparison itself is done in SQL/TypeScript (see the route);
+// the model only suggests everyday tasks/reminders. Everything it returns is
+// re-validated here and filtered for medical wording.
+
+export type ChangeKind = 'vital' | 'missed_doses' | 'incident' | 'mood' | 'medication' | 'prescription';
+export type ChangeSeverity = 'info' | 'watch' | 'alert';
+
+export interface DetectedChange {
+    /** Stable id within one response (c1, c2...). Suggestions must reference it. */
+    id: string;
+    kind: ChangeKind;
+    severity: ChangeSeverity;
+    /** One factual sentence, built from numbers, not from the model. */
+    fact: string;
+}
+
+// ─── Model call: explain + propose ───────────────────────────────────────────
+
+export const SUGGESTION_KINDS = ['task', 'reminder'] as const;
+export type SuggestionKind = (typeof SUGGESTION_KINDS)[number];
+
+export const CHANGES_SCHEMA: Record<string, unknown> = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['suggestions'],
+    properties: {
+        suggestions: {
+            type: 'array',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['change_id', 'kind', 'title', 'description', 'due_in_days', 'priority'],
+                properties: {
+                    change_id: { type: 'string' },
+                    kind: { type: 'string', enum: [...SUGGESTION_KINDS] },
+                    title: { type: 'string' },
+                    description: { type: 'string' },
+                    due_in_days: { type: 'number' },
+                    priority: { type: 'string', enum: [...TASK_PRIORITIES] },
+                },
+            },
+        },
+    },
+};
+
+export function buildChangesPrompt(changes: DetectedChange[], recipientFirstName: string, language: string, days: number): { system: string; user: string } {
+    const languageLabel = pick(pickLang(language), { fr: 'français', en: 'anglais', es: 'espagnol' });
+    const system = [
+        `Tu aides un cercle d'aidants familiaux autour de ${recipientFirstName || 'une personne âgée'}. On te donne une liste de CHANGEMENTS déjà détectés par le système en comparant les ${days} derniers jours aux ${days} jours précédents. Tu ne détectes rien toi-même.`,
+        ``,
+        `Réponds UNIQUEMENT avec un objet JSON: {"suggestions":[{"change_id":"c1","kind":"task","title":"...","description":"...","due_in_days":2,"priority":"Haute"}]}`,
+        ``,
+        `Règles:`,
+        `- "suggestions": 0 à 4 propositions. Chaque proposition DOIT référencer un change_id de la liste.`,
+        `- "kind": "task" pour quelque chose à faire, "reminder" pour un rappel à une date précise.`,
+        `- LANGAGE SIMPLE ET QUOTIDIEN UNIQUEMENT dans title et description: aucun vocabulaire médical ou de santé (pas de médecin, médicament, dose, traitement, douleur, symptôme, hôpital, infirmier, pharmacie, analyse, sang, consultation, etc.).`,
+        `- Propose seulement des gestes humains simples: prendre des nouvelles, appeler un proche, écrire une note dans le journal, passer du temps ensemble, demander de l'aide à un autre aidant, prévenir le cercle, revoir la routine de la journée.`,
+        `- Titre court (une action concrète), description d'une phrase.`,
+        `- due_in_days: nombre de jours à partir d'aujourd'hui (0 = aujourd'hui). priority parmi ${TASK_PRIORITIES.join('/')}.`,
+        `- N'invente aucun fait qui ne figure pas dans la liste.`,
+        `- Rédige tous les textes en ${languageLabel}. N'utilise jamais le caractère tiret long.`,
+    ].join('\n');
+    const user = changes.map((c) => `- ${c.id} [${c.severity}] ${c.fact}`).join('\n');
+    return { system, user };
+}
+
+export interface ChangeSuggestion {
+    change_id: string;
+    kind: SuggestionKind;
+    title: string;
+    description: string | null;
+    due_date: string; // YYYY-MM-DD, computed server-side
+    start_time: string; // YYYY-MM-DDT09:00:00, used when kind === 'reminder'
+    priority: string;
+}
+
+export interface ChangesResult {
+    summary: string;
+    changes: DetectedChange[];
+    suggestions: ChangeSuggestion[];
+}
+
+const clean = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+
+// ─── Plain-language guard ────────────────────────────────────────────────────
+
+/**
+ * Suggestions must read like everyday life, never like medical advice.
+ * Matched on accent-stripped lowercase text (EN / FR / ES word stems).
+ */
+const MEDICAL_TERM_RE = new RegExp(
+    '\\b(' +
+        [
+            'doctor\\w*', 'dr', 'physician\\w*', 'gp', 'medic\\w*', 'dos(e|es|age|ages|is)', 'pain\\w*', 'ache\\w*', 'sore',
+            'symptom\\w*', 'treat\\w*', 'therap\\w*', 'hospital\\w*', 'clinic\\w*', 'nurs\\w*', 'pharmac\\w*', 'prescri\\w*',
+            'drug\\w*', 'pill\\w*', 'tablet\\w*', 'inject\\w*', 'blood', 'labs?', 'tests?', 'consult\\w*', 'diagnos\\w*',
+            'oncolog\\w*', 'chemo\\w*', 'radio\\w*', 'cancer', 'tumou?r\\w*', 'scan', 'x-ray', 'mri', 'vital\\w*', 'pressure',
+            'tension', 'illness', 'disease\\w*', 'sick\\w*', 'health\\w*', 'patient\\w*', 'surgery', 'surgeon\\w*', 'emergency',
+            'medecin\\w*', 'douleur\\w*', 'ordonnance\\w*', 'traitement\\w*', 'symptome\\w*', 'infirmi\\w*', 'hopital\\w*',
+            'sang', 'analyse\\w*', 'posologie', 'malad\\w*', 'sante', 'urgence\\w*',
+            'dolor\\w*', 'receta\\w*', 'tratamiento\\w*', 'enfermer\\w*', 'farmacia\\w*', 'sintoma\\w*', 'sangre', 'salud',
+            'enfermedad\\w*', 'urgencia\\w*',
+        ].join('|') +
+        ')\\b'
+);
+
+const normalize = (t: string) => t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+export const containsMedicalTerm = (...texts: Array<string | null | undefined>): boolean =>
+    texts.some((t) => typeof t === 'string' && MEDICAL_TERM_RE.test(normalize(t)));
+
+type Localized = { fr: string; en: string; es: string };
+const PLAIN_TEMPLATES: Record<ChangeKind, { title: Localized; description: Localized; watch?: { title: Localized; description: Localized } }> = {
+    vital: {
+        watch: {
+            title: { fr: 'Noter dans le journal cette semaine', en: 'Add a note to the journal this week', es: 'Anotar en el diario esta semana' },
+            description: {
+                fr: 'Écrire comment il ou elle semble au fil des jours pour que le cercle puisse comparer.',
+                en: 'Write down how they seem from day to day so the circle can compare.',
+                es: 'Escribir cómo se le ve día a día para que el círculo pueda comparar.',
+            },
+        },
+        title: { fr: "Prendre des nouvelles aujourd'hui", en: 'Check in with them today', es: 'Hacer una visita hoy' },
+        description: {
+            fr: 'Passer un moment ensemble et écrire une courte note dans le journal.',
+            en: 'Spend a few minutes together and write a short note in the journal.',
+            es: 'Pasar un rato juntos y escribir una nota breve en el diario.',
+        },
+    },
+    missed_doses: {
+        title: { fr: 'Revoir la routine quotidienne ensemble', en: 'Look over the daily routine together', es: 'Revisar la rutina diaria juntos' },
+        description: {
+            fr: 'Voir ensemble ce qui a été oublié cette semaine et comment simplifier.',
+            en: 'See together what was missed this week and how to make it easier.',
+            es: 'Ver juntos lo que se olvidó esta semana y cómo facilitarlo.',
+        },
+    },
+    incident: {
+        title: { fr: 'En discuter avec le cercle', en: 'Talk it over with the circle', es: 'Hablarlo con el círculo' },
+        description: {
+            fr: "Partager ce qui s'est passé cette semaine avec les autres aidants et décider de la suite.",
+            en: 'Share what happened this week with the other caregivers and agree on next steps.',
+            es: 'Compartir lo ocurrido esta semana con los demás cuidadores y acordar los siguientes pasos.',
+        },
+    },
+    mood: {
+        title: { fr: 'Passer un bon moment ensemble', en: 'Spend some quality time together', es: 'Pasar un buen rato juntos' },
+        description: {
+            fr: "Prévoir une activité calme qui lui plaît et noter comment la journée s'est passée.",
+            en: 'Plan a calm activity they enjoy and note how the day went.',
+            es: 'Planear una actividad tranquila que disfrute y anotar cómo fue el día.',
+        },
+    },
+    medication: {
+        title: { fr: 'Prévenir tout le cercle', en: 'Let everyone in the circle know', es: 'Avisar a todo el círculo' },
+        description: {
+            fr: 'S’assurer que tous les aidants sont au courant du changement récent.',
+            en: 'Make sure all caregivers are aware of the recent change.',
+            es: 'Asegurarse de que todos los cuidadores conocen el cambio reciente.',
+        },
+    },
+    prescription: {
+        title: { fr: 'Vérifier les papiers à renouveler bientôt', en: 'Check the paperwork that is due soon', es: 'Revisar los papeles que vencen pronto' },
+        description: {
+            fr: "Regarder les documents dont l'échéance approche et décider qui s'en occupe.",
+            en: 'Look at the documents with an upcoming date and decide who takes care of them.',
+            es: 'Mirar los documentos con fecha próxima y decidir quién se encarga.',
+        },
+    },
+};
+
+const isoDay = (daysFromNow: number): string => {
+    const d = new Date(Date.now() + daysFromNow * 86_400_000);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+/** Neutral suggestion built from a template. Alerts become a dated reminder, others a task. */
+const buildPlainFallback = (change: DetectedChange, lang: string): ChangeSuggestion => {
+    const base = PLAIN_TEMPLATES[change.kind];
+    const l = pickLang(lang);
+    const alert = change.severity === 'alert';
+    const tpl = !alert && base.watch ? base.watch : base;
+    const due = isoDay(alert ? 2 : 5);
+    return {
+        change_id: change.id,
+        kind: alert ? 'reminder' : 'task',
+        title: pick(l, tpl.title),
+        description: pick(l, tpl.description),
+        due_date: due,
+        start_time: `${due}T09:00:00`,
+        priority: alert ? 'Haute' : 'Moyenne',
+    };
+};
+
+/** Summary built from the detected facts: always accurate, always in the user's language. */
+export const buildSummary = (changes: DetectedChange[], lang: string, days: number): string => {
+    const l = pickLang(lang);
+    const alerts = changes.filter((c) => c.severity === 'alert').length;
+    const watches = changes.filter((c) => c.severity === 'watch').length;
+    const n = changes.length;
+    if (n === 0) return '';
+    const head = pick(l, {
+        fr: `${n} changement${n > 1 ? 's' : ''} repéré${n > 1 ? 's' : ''} sur les ${days} derniers jours.`,
+        en: `${n} change${n > 1 ? 's' : ''} noticed over the last ${days} days.`,
+        es: `${n} cambio${n > 1 ? 's' : ''} detectado${n > 1 ? 's' : ''} en los últimos ${days} días.`,
+    });
+    const a = alerts ? pick(l, { fr: ` ${alerts} à suivre rapidement.`, en: ` ${alerts} to follow up soon.`, es: ` ${alerts} para atender pronto.` }) : '';
+    const w = watches ? pick(l, { fr: ` ${watches} à garder à l'œil.`, en: ` ${watches} to keep an eye on.`, es: ` ${watches} para vigilar.` }) : '';
+    return head + a + w;
+};
+
+/**
+ * Drops suggestions that do not reference a detected change or that use medical
+ * wording; recomputes dates; guarantees every alert/watch change a plain-language
+ * task or reminder (template-based) when the model gave none.
+ */
+export function validateChanges(raw: Record<string, unknown>, changes: DetectedChange[], lang = 'fr', days = 7): ChangesResult {
+    const byId = new Map(changes.map((c) => [c.id, c]));
+    const out: ChangeSuggestion[] = [];
+    const seen = new Set<string>();
+    const list = Array.isArray(raw.suggestions) ? (raw.suggestions as Array<Record<string, unknown>>) : [];
+
+    for (const s of list.slice(0, 5)) {
+        if (!s || typeof s !== 'object') continue;
+        const changeId = clean(s.change_id, 10);
+        const title = clean(s.title, 255);
+        const description = clean(s.description, 1000) || null;
+        if (!byId.has(changeId) || !title || seen.has(title.toLowerCase())) continue;
+        if (containsMedicalTerm(title, description)) continue; // plain language only
+        seen.add(title.toLowerCase());
+
+        const days = Math.min(30, Math.max(0, Math.round(Number(s.due_in_days) || 0)));
+        const due = isoDay(days);
+        const priority = clean(s.priority, 20);
+        const kind = (SUGGESTION_KINDS as readonly string[]).includes(clean(s.kind, 10)) ? (clean(s.kind, 10) as SuggestionKind) : 'task';
+        out.push({
+            change_id: changeId,
+            kind,
+            title,
+            description,
+            due_date: due,
+            start_time: `${due}T09:00:00`,
+            priority: (TASK_PRIORITIES as readonly string[]).includes(priority) ? priority : 'Moyenne',
+        });
+    }
+
+    const covered = new Set(out.map((x) => x.change_id));
+    for (const c of changes) {
+        if (c.severity === 'info' || covered.has(c.id) || out.length >= 6) continue;
+        const fallback = buildPlainFallback(c, lang);
+        // Two changes can map to the same everyday action: propose it once.
+        if (!out.some((x) => x.title === fallback.title)) out.push(fallback);
+    }
+    return { summary: buildSummary(changes, lang, days), changes, suggestions: out };
+}

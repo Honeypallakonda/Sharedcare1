@@ -13,6 +13,7 @@ import { useWebSocketUpdates } from '../hooks/useWebSocketUpdates';
 import { dateLocale, intlLocale } from '../i18n/format';
 import { formatVital, type UnitSystem } from '../lib/units';
 import WeeklyDigestCard from '../components/app/WeeklyDigestCard';
+import ChangesCard from '../components/app/ChangesCard';
 import PresenceBanner from '../components/app/PresenceBanner';
 import HeatwaveBanner from '../components/app/HeatwaveBanner';
 import HouseholdOverview from '../components/app/HouseholdOverview';
@@ -513,6 +514,7 @@ const Dashboard: React.FC = () => {
 
             {/* Weekly AI digest: full width, below the grid */}
             <WeeklyDigestCard />
+            <ChangesCard />
             </>
             )}
         </div>
