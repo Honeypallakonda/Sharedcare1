@@ -92,7 +92,8 @@ docker-compose up -d --build
 
 ### 💾 Backups
 
-Everything lives in PostgreSQL, so one dump is a full backup.
+Everything lives in PostgreSQL, so one dump is a full backup. Keep your `.env`
+(JWT and VAPID secrets) somewhere else, or add `--with-env` to copy it alongside.
 
 ```bash
 bash scripts/backup.sh              # writes a checked, compressed dump to ./backups

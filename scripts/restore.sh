@@ -69,7 +69,8 @@ if [[ "$FILE" == *.gz ]]; then
 else
   READ_CMD=(cat "$FILE")
 fi
-if ! "${READ_CMD[@]}" | grep -q "CREATE TABLE"; then
+# grep -c et non grep -q : voir la meme verification dans backup.sh.
+if ! "${READ_CMD[@]}" | grep -c "CREATE TABLE" >/dev/null; then
   echo "[ERREUR] Ce fichier ne ressemble pas a une sauvegarde OpenCare." >&2
   exit 1
 fi
@@ -109,6 +110,16 @@ else
     -U "$DB_USER" -d "$DB_NAME" >/dev/null
 fi
 
+# Le .env n'est jamais remplace automatiquement : on signale la copie prise
+# avec ce dump, a remettre a la main seulement si l'actuel est perdu.
+ENV_COPY="${FILE%.gz}"
+ENV_COPY="${ENV_COPY%.sql}.env"
+
 echo
 echo "Restauration terminee. Redemarrez le serveur applicatif :"
 echo "docker compose up -d server"
+if [[ -f "$ENV_COPY" ]]; then
+  echo
+  echo "Le .env pris avec cette sauvegarde : $ENV_COPY"
+  echo "Votre .env actuel n'a pas ete touche. Copiez celui-ci a sa place s'il est perdu."
+fi
