@@ -17,7 +17,7 @@
 #    .\build-local.ps1
 #
 #  Options :
-#    -Version 1.2.1     Numero de version a graver dans l'installeur
+#    -Version 1.2.2     Numero de version a graver dans l'installeur
 #    -SkipDeps          Ne pas (re)installer Node/Inno/ImageMagick
 #    -Run               Lancer l'installeur automatiquement a la fin
 #    -WorkDir C:\OFbuild Copier le repo ici avant build (recommande si le
@@ -26,7 +26,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Version = "1.2.1",
+    [string]$Version = "1.2.2",
     [switch]$SkipDeps,
     [switch]$Run,
     [switch]$NoPrompt,

@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version à compiler (ex. 1.2.1)"
+        description: "Version à compiler (ex. 1.2.2)"
         required: false
-        default: "1.2.1"
+        default: "1.2.2"
 
 permissions:
   contents: write
