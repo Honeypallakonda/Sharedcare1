@@ -26,7 +26,7 @@
     },
     "devDependencies": {
         "concurrently": "^8.2.2",
-        "vitest": "^4.0.7"
+        "vitest": "^4.1.12"
     },
     "overrides": {
         "serialize-javascript": "7.0.5",
