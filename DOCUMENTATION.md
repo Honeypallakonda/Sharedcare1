@@ -269,10 +269,10 @@ bash scripts/backup.sh                  # pile Docker, écrit dans ./backups
 bash scripts/backup.sh --dir /mnt/nas   # ailleurs, disque externe ou NAS
 bash scripts/backup.sh --keep 30        # ne garde que les 30 plus récentes
 bash scripts/backup.sh --direct         # PostgreSQL local, sans Docker
-bash scripts/backup.sh --no-env         # sans copie du .env
+bash scripts/backup.sh --with-env       # copie aussi le .env, à ranger à part
 ```
 
-Le fichier est un `pg_dump` compressé, nommé par sa date, écrit en 600. Il n'apparaît qu'une fois vérifié : un dump vide ou tronqué est supprimé plutôt que publié, parce qu'une sauvegarde à laquelle on ne peut pas se fier est pire que pas de sauvegarde. Le `.env` est copié à côté, sous le même horodatage (`opencare-20260925-093000.env`), lui aussi en 600 : sans ses secrets JWT et VAPID, une base restaurée déconnecte tout le monde et casse les abonnements push. La rotation supprime les deux fichiers ensemble ; `--no-env` désactive la copie. Une ligne de cron suffit à l'automatiser :
+Le fichier est un `pg_dump` compressé, nommé par sa date, écrit en 600. Il n'apparaît qu'une fois vérifié : un dump vide ou tronqué est supprimé plutôt que publié, parce qu'une sauvegarde à laquelle on ne peut pas se fier est pire que pas de sauvegarde. Le `.env` n'est pas copié par défaut. Sans ses secrets JWT et VAPID, une base restaurée déconnecte tout le monde et casse les abonnements push, il faut donc le sauvegarder aussi ; mais il contient `JWT_SECRET` et la clé qui chiffre les identifiants des intégrations et de l'IA. Rangé à côté des dumps, sur un NAS ou un disque externe, il ferait d'une sauvegarde perdue de quoi ouvrir des sessions sur l'instance en service et déchiffrer ces identifiants. Gardez-le de préférence ailleurs (gestionnaire de mots de passe, coffre chiffré). `--with-env` le copie malgré tout à côté de chaque dump, sous le même horodatage (`opencare-20260925-093000.env`) et en 600 ; la rotation supprime alors les deux fichiers ensemble. Une ligne de cron suffit à automatiser la sauvegarde :
 
 ```
 30 3 * * * cd /opt/opencare && bash scripts/backup.sh --keep 30 >> /var/log/opencare-backup.log 2>&1
