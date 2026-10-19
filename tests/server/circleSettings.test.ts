@@ -153,6 +153,12 @@ describe('inheritedSettings', () => {
         expect(inherited).toEqual({ unit_system: 'imperial', week_start: 'sunday', emergency_numbers: '911' });
     });
 
+    it('reprend aussi les types d aides, qui dependent du pays', () => {
+        expect(inheritedSettings({ aid_types: ['Medicaid', 'VA benefits'] })).toEqual({ aid_types: ['Medicaid', 'VA benefits'] });
+        // Une liste invalide (doublon) n'est pas reprise : le nouveau cercle garde la liste par defaut.
+        expect(inheritedSettings({ aid_types: ['Medicaid', 'medicaid'] })).toEqual({});
+    });
+
     it('laisse les defauts aux cles absentes ou invalides', () => {
         expect(inheritedSettings({ unit_system: 'furlongs', emergency_numbers: '  ' })).toEqual({});
         expect(inheritedSettings(null)).toEqual({});

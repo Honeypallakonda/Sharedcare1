@@ -195,7 +195,8 @@ export function validateSettingsPatch(input: unknown, lang: Lang): { patch?: Rec
 /**
  * Les preferences regionales qu'un nouveau cercle reprend du cercle auquel il
  * est rattache (meme foyer, donc meme pays) : unites, premier jour de la
- * semaine, numeros d'urgence. Seules les cles reellement choisies et valides
+ * semaine, numeros d'urgence, types d'aides (les aides dependent du pays).
+ * Seules les cles reellement choisies et valides
  * passent ; jamais une cle privee comme l'empreinte du code Kiosk.
  */
 export function inheritedSettings(raw: unknown): Partial<PublicCircleSettings> {
@@ -205,6 +206,8 @@ export function inheritedSettings(raw: unknown): Partial<PublicCircleSettings> {
     if (isWeekStart(source.week_start)) inherited.week_start = source.week_start;
     const numbers = cleanEmergencyNumbers(source.emergency_numbers);
     if (numbers) inherited.emergency_numbers = numbers;
+    const aidTypes = checkAidTypes(source.aid_types ?? null);
+    if ('list' in aidTypes && aidTypes.list) inherited.aid_types = aidTypes.list;
     return inherited;
 }
 
