@@ -361,6 +361,12 @@
     .contributor-card:hover img { border-color: rgba(62,107,84,.4); }
     .c-name { font-weight: 600; font-size: 0.87rem; }
     .c-role { font-size: 0.72rem; color: var(--muted); }
+    .c-count {
+      font-size: 0.73rem; color: var(--muted);
+      background: var(--surface-2); border: 1px solid var(--border);
+      padding: 0.18rem 0.6rem; border-radius: 999px;
+    }
+    .contributor-card.lead .c-count { color: var(--primary); border-color: rgba(62,107,84,.28); background: var(--primary-soft); }
     .heritage-note {
       display: flex; align-items: flex-start; gap: 1rem;
       background: var(--surface); border: 1px solid rgba(62,107,84,.18);
@@ -874,9 +880,10 @@ API      : http://localhost:3001/health</pre>
   <h2>Remerciements</h2>
   <p class="section-desc">Développé et maintenu par NexaFlow France, et offert à toutes les familles qui prennent soin de quelqu'un.</p>
   <div class="contributors-grid">
-    <a class="contributor-card" href="https://github.com/NexaFlowFrance" target="_blank" rel="noopener">
+    <a class="contributor-card lead" href="https://github.com/NexaFlowFrance" target="_blank" rel="noopener">
       <img src="https://avatars.githubusercontent.com/u/251752333?v=4" alt="NexaFlowFrance" />
       <span class="c-name">NexaFlowFrance</span>
+      <span class="c-count">43 commits</span>
     </a>
     <a class="contributor-card" href="https://github.com/thecybermacgyver" target="_blank" rel="noopener">
       <img src="https://github.com/thecybermacgyver.png?size=128" alt="thecybermacgyver" />
@@ -886,12 +893,12 @@ API      : http://localhost:3001/health</pre>
     <a class="contributor-card" href="https://github.com/mpking828" target="_blank" rel="noopener">
       <img src="https://github.com/mpking828.png?size=128" alt="mpking828" />
       <span class="c-name">mpking828</span>
-      <span class="c-role">Fuseau horaire et fiche urgence traduite</span>
+      <span class="c-count">20 commits</span>
     </a>
     <a class="contributor-card" href="https://github.com/QuentinCazier" target="_blank" rel="noopener">
       <img src="https://github.com/QuentinCazier.png?size=128" alt="QuentinCazier" />
       <span class="c-name">QuentinCazier</span>
-      <span class="c-role">Escalade des alertes</span>
+      <span class="c-count">3 commits</span>
     </a>
   </div>
 
